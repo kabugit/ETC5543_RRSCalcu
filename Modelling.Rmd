@@ -1,0 +1,507 @@
+---
+title: "Modelling - Entresto prediction - IQVIA"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r}
+library(tidyverse)
+library(epiDisplay)
+library(neuralnet)
+library(randomForest)
+library(caTools)
+library(e1071)
+library(MASS)
+library(caret)
+library(ISLR)
+```
+
+```{r}
+entr <- readxl::read_xlsx(here::here("data","EntrPats.xlsx")) # Entresto users (comorbidities classification)
+nentr <- readxl::read_xlsx(here::here("data","nonEntrPats.xlsx")) # Non-Entresto users (comorbidities classification)
+
+entrC <- readxl::read_xlsx(here::here("data","EntrCard.xlsx")) # Entresto users (cardiac drug classification)
+nentrC <- readxl::read_xlsx(here::here("data","nEntrCard.xlsx")) # Non-Entresto users (cardiac drug classification)
+
+# Replacing null values, conversion so that we have one row per patient
+
+entrC[entrC=="(null)"] <- "0"
+nentrC[nentrC=="(null)"] <- "0"
+card <- rbind(entrC, nentrC)
+
+card1 <- card %>% pivot_longer(BB:ARB, names_to = "cond", values_to = "values")
+
+card1 <- card1 %>% filter(values != 0)
+card1 <- card1 %>% pivot_wider(names_from = cond, values_from = values)
+
+card1[is.na(card1)] = "0"
+
+card1 <- card1 %>% mutate(BB = as.numeric(BB),
+                          CCB = as.numeric(CCB),
+                          LIP = as.numeric(LIP),
+                          DIU = as.numeric(DIU),
+                          ACEI = as.numeric(ACEI),
+                          ARB = as.numeric(ARB),
+                          ANTIHYP = as.numeric(ANTIHYP),
+                          CARDT = as.numeric(CARDT),
+                          VASOP = as.numeric(VASOP),
+                          PERIVASO = as.numeric(PERIVASO))
+
+```
+
+
+```{r}
+# Adding Entr variable
+
+entr <- entr %>% filter(Conditions != '0')
+entr <- entr %>% mutate(Value = 1,
+                        ENTRESTO = 1)
+
+
+nentr <- nentr %>% filter(Conditions != '0')
+nentr <- nentr %>% mutate(Value = 1,
+                        ENTRESTO = 0)
+```
+
+```{r}
+# Binary conversion
+
+entr.w <- entr %>% 
+  pivot_wider(names_from = Conditions, values_from = Value)
+
+entr.w[is.na(entr.w)] = 0
+
+nentr.w <- nentr %>% 
+  pivot_wider(names_from = Conditions, values_from = Value)
+
+nentr.w[is.na(nentr.w)] = 0
+nentr.w <- nentr.w %>% head(52405) # Selecting as many nonEntr patients as Entr patients, so its 52k v/s 52k
+```
+
+
+```{r}
+
+# Combining Entr and nonEntr patients
+
+temp <- entr.w %>% dplyr::select(-entrestoInitDate)
+
+data.all <- rbind(temp, nentr.w)
+
+# Combining cardiac classifications
+
+final <- merge(data.all, card1, by = "MasterPatient_ID", all.x = TRUE)
+
+final[is.na(final)] = 0
+```
+
+```{r}
+
+# Removing less occurring features
+
+data.all1 <- final %>% dplyr::select(-`ALCOHOL DEPENDENCY`, -GOUT, -GLAUCOMA, -`OSTEOPOROSIS/PAGET’S`, -EPILEPSY, -ALLERGIES, -`BENIGN PROSTATIC HYPERPLASIA`, -PSORIASIS, -`PSYCHOTIC ILLNESS`, -MIGRAINE, -`IRRITABLE BOWEL SYNDROME`, -MALIGNANCIES, -TRANSPLANT, -TUBERCULOSIS)
+
+```
+
+```{r}
+# Correlation check
+
+colnames(data.all1) <- abbreviate(colnames(data.all1))
+
+data.all1$ENTR <- as.numeric(data.all1$ENTR)
+
+cora <- cor(data.all1 %>% dplyr::select(-MP_I))
+corrplot::corrplot(cora, method = "color")
+```
+
+```{r}
+# Calculating (unweighted) Rx-risk score
+
+e <- entr.w
+
+e$RRS <- rowSums( entr.w[,4:48] )
+
+ne <- nentr.w
+
+ne$RRS <- rowSums( nentr.w[,3:47] )
+
+e$MasterPatient_ID <- as.character(e$MasterPatient_ID)
+
+e <- e %>% dplyr::select(-entrestoInitDate)
+
+rrs <- rbind(e, ne) 
+```
+
+
+
+```{r}
+
+
+# Removing variables with low numbers
+
+
+data.mod <- data.all1 %>% dplyr::select(-BIPD, -DEME, -HEPB, -HEPC, -HYPERK, -LIVF, -PANI, -PULH)
+
+d <- data.mod %>% pivot_longer(3:35, names_to = "cond", values_to = "value") %>% group_by(cond) %>% filter(sum(value) >= 10000) # Checking again to be sure
+
+data.mod1 <- d %>% pivot_wider(names_from = cond, values_from = value)
+
+data.mod1 <- data.mod1 %>% rename(MasterPatient_ID = "MP_I")
+
+
+# Creating more dummy variables, specifically for cardiac drug classes and unweighted Rx-risk score
+
+## adding RRS
+
+rrs1 <- rrs %>% dplyr::select(MasterPatient_ID, RRS)
+
+data.mod <- merge(data.mod1, rrs1, by = "MasterPatient_ID")
+
+data.mod1 <- data.mod %>% dplyr::select(-MasterPatient_ID)
+
+
+## At this stage would like to do some cluster analysis w.r.t Rx-risk score, for eg, do we see any classifications popping out of particular ranges of Rx-risk score? This could help us create more meaningful features.
+
+
+## Adding cardiac drug class combinations
+
+data.mod <- data.mod %>% mutate(ARB_ACEI = ifelse(ARB == 1 & ACEI == 1, 1,0),
+                    ARB_BB = ifelse(ARB == 1 & BB == 1, 1,0),
+                    ARB_CCB = ifelse(ARB == 1 & CCB == 1, 1,0),
+                    ARB_DIU = ifelse(ARB == 1 & DIU == 1, 1,0),
+                    ARB_LIP = ifelse(ARB == 1 & LIP == 1, 1,0),
+                    ARB_ANTIH = ifelse(ARB == 1 & ANTIH == 1, 1,0),
+                    ARB_CARD = ifelse(ARB == 1 & CARD == 1, 1,0),
+                    
+                    ACEI_BB = ifelse(ACEI == 1 & BB == 1, 1,0),
+                    ACEI_CCB = ifelse(ACEI == 1 & CCB == 1, 1,0),
+                    ACEI_DIU = ifelse(ACEI == 1 & DIU == 1, 1,0),
+                    ACEI_LIP = ifelse(ACEI == 1 & LIP == 1, 1,0),
+                    ACEI_ANTIH = ifelse(ACEI == 1 & ANTIH == 1, 1,0),
+                    ACEI_CARD = ifelse(ACEI == 1 & CARD == 1, 1,0),
+                    
+                    BB_CCB = ifelse(BB == 1 & CCB == 1, 1,0),
+                    BB_DIU = ifelse(BB == 1 & DIU == 1, 1,0),
+                    BB_LIP = ifelse(BB == 1 & LIP == 1, 1,0),
+                    BB_ANTIH = ifelse(BB == 1 & ANTIH == 1, 1,0),
+                    BB_CARD = ifelse(BB == 1 & CARD == 1, 1,0),
+                    
+                    CCB_DIU = ifelse(CCB == 1 & DIU == 1, 1,0),
+                    CCB_LIP = ifelse(CCB == 1 & LIP == 1, 1,0),
+                    CCB_ANTIH = ifelse(CCB == 1 & ANTIH == 1, 1,0),
+                    CCB_CARD = ifelse(CCB == 1 & CARD == 1, 1,0),
+                    
+                    DIU_LIP = ifelse(DIU == 1 & LIP == 1, 1,0),
+                    DIU_ANTIH = ifelse(DIU == 1 & ANTIH == 1, 1,0),
+                    DIU_CARD = ifelse(DIU == 1 & CARD == 1, 1,0),
+                    
+                    CARD_ANTIH = ifelse(DIU == 1 & ANTIH == 1, 1,0))
+
+
+### removing uncommon vars
+
+d <- data.mod %>% pivot_longer(3:35, names_to = "cond", values_to = "value") %>% group_by(cond) %>% filter(sum(value) >= 10000) # ARB_ANTIH was removed
+
+data.mod1 <- d %>% pivot_wider(names_from = cond, values_from = value) 
+
+### adding dates of cardiac drug classes taken by all Entresto patients. Note - Only covers Entresto patients and can not be added in model as long as strategy for non Entresto patients is not devised.
+
+
+lastbb <- readxl::read_xlsx(here::here("data","DateBB.xlsx")) %>% mutate(LastBB = as.Date(LastBB))
+lastccb <- readxl::read_xlsx(here::here("data","DateCCB.xlsx")) %>% mutate(LastCCB = as.Date(LastCCB))
+lastarb <- readxl::read_xlsx(here::here("data","DateARB.xlsx")) %>% mutate(LastARB = as.Date(LastARB))
+lastacei <- readxl::read_xlsx(here::here("data","DateACEI.xlsx")) %>% mutate(LastACEI = as.Date(LastACEI))
+lastlip <- readxl::read_xlsx(here::here("data","DateLIP.xlsx")) %>% mutate(LastLIP = as.Date(LastLIP))
+lastdiu <- readxl::read_xlsx(here::here("data","DateDIU.xlsx")) %>% mutate(LastDIU = as.Date(LastDIU))
+lastantihyp <- readxl::read_xlsx(here::here("data","DateANTIHYP.xlsx")) %>% mutate(LastANTIHYP = as.Date(LastANTIHYP))
+lastcardt <- readxl::read_xlsx(here::here("data","DateCARDT.xlsx")) %>% mutate(LastCARDT = as.Date(LastCARDT))
+
+### creating binary vars for day ranges
+
+lastbb <- merge(lastbb, entr.w %>% dplyr::select(MasterPatient_ID, entrestoInitDate), by = "MasterPatient_ID") %>% mutate(entrestoInitDate = as.Date(entrestoInitDate))
+lastbb <- lastbb %>% mutate(diff = entrestoInitDate - LastBB)
+
+lastbb <- lastbb %>% mutate(BB30 = ifelse(diff <= 30, 1,0),
+                            BB60 = ifelse(diff > 30 & diff <= 60, 1,0),
+                            BB90 = ifelse(diff > 60 & diff <= 90, 1,0),
+                            BB180 = ifelse(diff > 90 & diff <= 180, 1,0),
+                            BB360 = ifelse(diff > 180 & diff <= 360, 1,0),
+                            BB720 = ifelse(diff > 360 & diff <= 720, 1,0),
+                            BB720 = ifelse(diff > 360, 1,0))
+
+lastccb <- merge(lastccb, entr.w %>% dplyr::select(MasterPatient_ID, entrestoInitDate), by = "MasterPatient_ID") %>% mutate(entrestoInitDate = as.Date(entrestoInitDate))
+lastccb <- lastccb %>% mutate(diff = entrestoInitDate - LastCCB)
+lastccb <- lastccb %>% mutate(ccb30 = ifelse(diff <= 30, 1,0),
+                            ccb60 = ifelse(diff > 30 & diff <= 60, 1,0),
+                            ccb90 = ifelse(diff > 60 & diff <= 90, 1,0),
+                            ccb180 = ifelse(diff > 90 & diff <= 180, 1,0),
+                            ccb360 = ifelse(diff > 180 & diff <= 360, 1,0),
+                            ccb720 = ifelse(diff > 360, 1,0))
+
+lastarb <- merge(lastarb, entr.w %>% dplyr::select(MasterPatient_ID, entrestoInitDate), by = "MasterPatient_ID") %>% mutate(entrestoInitDate = as.Date(entrestoInitDate))
+lastarb <- lastarb %>% mutate(diff = entrestoInitDate - LastARB)
+lastarb <- lastarb %>% mutate(arb30 = ifelse(diff <= 30, 1,0),
+                            arb60 = ifelse(diff > 30 & diff <= 60, 1,0),
+                            arb90 = ifelse(diff > 60 & diff <= 90, 1,0),
+                            arb180 = ifelse(diff > 90 & diff <= 180, 1,0),
+                            arb360 = ifelse(diff > 180 & diff <= 360, 1,0),
+                            arb720 = ifelse(diff > 360, 1,0))
+
+lastacei <- merge(lastacei, entr.w %>% dplyr::select(MasterPatient_ID, entrestoInitDate), by = "MasterPatient_ID") %>% mutate(entrestoInitDate = as.Date(entrestoInitDate))
+lastacei <- lastacei %>% mutate(diff = entrestoInitDate - LastACEI)
+lastacei <- lastacei %>% mutate(acei30 = ifelse(diff <= 30, 1,0),
+                            acei60 = ifelse(diff > 30 & diff <= 60, 1,0),
+                            acei90 = ifelse(diff > 60 & diff <= 90, 1,0),
+                            acei180 = ifelse(diff > 90 & diff <= 180, 1,0),
+                            acei360 = ifelse(diff > 180 & diff <= 360, 1,0),
+                            acei720 = ifelse(diff > 360, 1,0))
+
+lastlip <- merge(lastlip, entr.w %>% dplyr::select(MasterPatient_ID, entrestoInitDate), by = "MasterPatient_ID") %>% mutate(entrestoInitDate = as.Date(entrestoInitDate))
+lastlip <- lastlip %>% mutate(diff = entrestoInitDate - LastLIP)
+lastlip <- lastlip %>% mutate(lip30 = ifelse(diff <= 30, 1,0),
+                            lip60 = ifelse(diff > 30 & diff <= 60, 1,0),
+                            lip90 = ifelse(diff > 60 & diff <= 90, 1,0),
+                            lip180 = ifelse(diff > 90 & diff <= 180, 1,0),
+                            lip360 = ifelse(diff > 180 & diff <= 360, 1,0),
+                            lip720 = ifelse(diff > 360 & diff <= 720, 1,0))
+
+lastdiu <- merge(lastdiu, entr.w %>% dplyr::select(MasterPatient_ID, entrestoInitDate), by = "MasterPatient_ID") %>% mutate(entrestoInitDate = as.Date(entrestoInitDate))
+lastdiu <- lastdiu %>% mutate(diff = entrestoInitDate - LastDIU)
+lastdiu <- lastdiu %>% mutate(diu30 = ifelse(diff <= 30, 1,0),
+                            diu60 = ifelse(diff > 30 & diff <= 60, 1,0),
+                            diu90 = ifelse(diff > 60 & diff <= 90, 1,0),
+                            diu180 = ifelse(diff > 90 & diff <= 180, 1,0),
+                            diu360 = ifelse(diff > 180 & diff <= 360, 1,0),
+                            diu720 = ifelse(diff > 360, 1,0))
+
+lastantihyp <- merge(lastantihyp, entr.w %>% dplyr::select(MasterPatient_ID, entrestoInitDate), by = "MasterPatient_ID") %>% mutate(entrestoInitDate = as.Date(entrestoInitDate))
+lastantihyp <- lastantihyp %>% mutate(diff = entrestoInitDate - LastANTIHYP)
+lastantihyp <- lastantihyp %>% mutate(antih30 = ifelse(diff <= 30, 1,0),
+                            antih60 = ifelse(diff > 30 & diff <= 60, 1,0),
+                            antih90 = ifelse(diff > 60 & diff <= 90, 1,0),
+                            antih180 = ifelse(diff > 90 & diff <= 180, 1,0),
+                            antih360 = ifelse(diff > 180 & diff <= 360, 1,0),
+                            antih720 = ifelse(diff > 360, 1,0))
+
+lastcardt <- merge(lastcardt, entr.w %>% dplyr::select(MasterPatient_ID, entrestoInitDate), by = "MasterPatient_ID") %>% mutate(entrestoInitDate = as.Date(entrestoInitDate))
+lastcardt <- lastcardt %>% mutate(diff = entrestoInitDate - LastCARDT)
+lastcardt <- lastcardt %>% mutate(card30 = ifelse(diff <= 30, 1,0),
+                            card60 = ifelse(diff > 30 & diff <= 60, 1,0),
+                            card90 = ifelse(diff > 60 & diff <= 90, 1,0),
+                            card180 = ifelse(diff > 90 & diff <= 180, 1,0),
+                            card360 = ifelse(diff > 180 & diff <= 360, 1,0),
+                            card720 = ifelse(diff > 360, 1,0))
+
+### subset binary vars
+
+lastbb <- lastbb %>% dplyr::select(-entrestoInitDate, -diff, -LastBB)
+lastccb <- lastccb %>% dplyr::select(-entrestoInitDate, -diff, -LastCCB)
+lastarb <- lastarb %>% dplyr::select(-entrestoInitDate, -diff, -LastARB)
+lastacei <- lastacei %>% dplyr::select(-entrestoInitDate, -diff, -LastACEI)
+lastlip <- lastlip %>% dplyr::select(-entrestoInitDate, -diff, -LastLIP)
+lastcardt <- lastcardt %>% dplyr::select(-entrestoInitDate, -diff, -LastCARDT)
+lastantihyp <- lastantihyp %>% dplyr::select(-entrestoInitDate, -diff, -LastANTIHYP)
+lastdiu <- lastdiu %>% dplyr::select(-entrestoInitDate, -diff, -LastDIU)
+
+
+### converting so that we get one row per patient ID
+
+lastbb <- lastbb %>% pivot_longer(2:7, names_to = "cond", values_to = "values")
+lastbb <- lastbb %>% filter(values != 0) 
+lastbb <- distinct(lastbb, MasterPatient_ID,cond,values, .keep_all= TRUE)
+lastbb <- lastbb %>% pivot_wider(names_from = cond, values_from = values)
+lastbb[is.na(lastbb)] = 0
+
+lastccb <- lastccb %>% pivot_longer(2:7, names_to = "cond", values_to = "values")
+lastccb <- lastccb %>% filter(values != 0) 
+lastccb <- distinct(lastccb, MasterPatient_ID,cond,values, .keep_all= TRUE)
+lastccb <- lastccb %>% pivot_wider(names_from = cond, values_from = values)
+lastccb[is.na(lastccb)] = 0
+
+
+lastarb <- lastarb %>% pivot_longer(2:7, names_to = "cond", values_to = "values")
+lastarb <- lastarb %>% filter(values != 0) 
+lastarb <- distinct(lastarb, MasterPatient_ID,cond,values, .keep_all= TRUE)
+lastarb <- lastarb %>% pivot_wider(names_from = cond, values_from = values)
+lastarb[is.na(lastarb)] = 0
+
+
+lastacei <- lastacei %>% pivot_longer(2:7, names_to = "cond", values_to = "values")
+lastacei <- lastacei %>% filter(values != 0) 
+lastacei <- distinct(lastacei, MasterPatient_ID,cond,values, .keep_all= TRUE)
+lastacei <- lastacei %>% pivot_wider(names_from = cond, values_from = values)
+lastacei[is.na(lastacei)] = 0
+
+lastlip <- lastlip %>% pivot_longer(2:7, names_to = "cond", values_to = "values")
+lastlip <- lastlip %>% filter(values != 0) 
+lastlip <- distinct(lastlip, MasterPatient_ID,cond,values, .keep_all= TRUE)
+lastlip <- lastlip %>% pivot_wider(names_from = cond, values_from = values)
+lastlip[is.na(lastlip)] = 0
+
+lastcardt <- lastcardt %>% pivot_longer(2:7, names_to = "cond", values_to = "values")
+lastcardt <- lastcardt %>% filter(values != 0) 
+lastcardt <- distinct(lastcardt, MasterPatient_ID,cond,values, .keep_all= TRUE)
+lastcardt <- lastcardt %>% pivot_wider(names_from = cond, values_from = values)
+lastcardt[is.na(lastcardt)] = 0
+
+lastantihyp <- lastantihyp %>% pivot_longer(2:7, names_to = "cond", values_to = "values")
+lastantihyp <- lastantihyp %>% filter(values != 0) 
+lastantihyp <- distinct(lastantihyp, MasterPatient_ID,cond,values, .keep_all= TRUE)
+lastantihyp <- lastantihyp %>% pivot_wider(names_from = cond, values_from = values)
+lastantihyp[is.na(lastantihyp)] = 0
+
+lastdiu <- lastdiu %>% pivot_longer(2:7, names_to = "cond", values_to = "values")
+lastdiu <- lastdiu %>% filter(values != 0) 
+lastdiu <- distinct(lastdiu, MasterPatient_ID,cond,values, .keep_all= TRUE)
+lastdiu <- lastdiu %>% pivot_wider(names_from = cond, values_from = values)
+lastdiu[is.na(lastdiu)] = 0
+
+### Combining all cardiac classes
+
+card_date <- merge(lastbb, lastccb, by = "MasterPatient_ID", all.x = TRUE, all.y = TRUE)
+card_date <- merge(card_date, lastarb, by = "MasterPatient_ID", all.x = TRUE, all.y = TRUE)
+card_date <- merge(card_date, lastacei, by = "MasterPatient_ID", all.x = TRUE, all.y = TRUE)
+card_date <- merge(card_date, lastlip, by = "MasterPatient_ID", all.x = TRUE, all.y = TRUE)
+card_date <- merge(card_date, lastcardt, by = "MasterPatient_ID", all.x = TRUE, all.y = TRUE)
+card_date <- merge(card_date, lastantihyp, by = "MasterPatient_ID", all.x = TRUE, all.y = TRUE)
+card_date <- merge(card_date, lastdiu, by = "MasterPatient_ID", all.x = TRUE, all.y = TRUE)
+
+### Joining with main dataset
+
+data.mod2 <- merge(data.mod1, card_date, by = "MasterPatient_ID", all.x = TRUE, all.y = TRUE)
+
+### Removing NAs
+
+data.mod2[is.na(data.mod2)]= 0
+
+### Adding RRS range
+
+temp1 <- data.mod2 %>% dplyr::select(MasterPatient_ID, RRS)
+
+temp1 <- temp1 %>% pivot_longer(2,names_to = "name", values_to = "value") %>% 
+  mutate(RRS_0_3 = ifelse(value <= 3, 1,0),
+         RRS_4_6 = ifelse(value > 3 & value <=6, 1,0),
+         RRS_7_9 = ifelse(value > 6 & value <=9, 1,0),
+         RRS_10_12 = ifelse(value > 9 & value <=12, 1,0),
+         RRS_13_15 = ifelse(value > 12 & value <=15, 1,0),
+         RRS_15up = ifelse(value > 15, 1,0))
+
+temp1 <- temp1 %>% dplyr::select(-name, -value)
+
+#### Personal check - can the above repetitive steps be converted into a function?
+
+### Joining with main dataset
+
+data.mod2 <- merge(data.mod2, temp1, by = "MasterPatient_ID", all.x = TRUE)
+
+```
+
+
+```{r lr}
+# Model - logreg UniSA
+
+data.mod3 <- data.mod2 %>% dplyr::select(-MasterPatient_ID, -RRS) # to use only binary features for modelling
+
+dat <- data.mod3[,1:50] # Choosing only first 50 features to reduce stress on model and excluding date features for now
+
+cols <- colnames(dat)
+
+dat[cols] <- lapply(dat[cols], factor) # converting binary features to factors for modelling
+
+
+
+
+dat1 <- dat %>% dplyr::select(-CARD_ANTIH)
+
+set.seed(1)
+sample = sample.split(dat1$ENTR, SplitRatio = .80)
+train = subset(dat1, sample == TRUE)
+test  = subset(dat1, sample == FALSE)
+
+log.m <- glm(ENTR ~ ., data = train, family = "binomial")
+
+summary(log.m)
+
+predtr.logm <- predict(object = log.m, newdata = train, type = "response")
+
+predte.logm <- predict(object = log.m, newdata = test, type = "response")
+
+confusionMatrix(
+  data = as.factor(ifelse(predtr.logm > 0.5, 1, 0)), 
+  train$ENTR
+)
+
+confusionMatrix(
+  data = as.factor(ifelse(predte.logm > 0.5, 1, 0)), 
+  test$ENTR
+)
+```
+
+```{r rf}
+
+## Model - Random Forest
+
+# set.seed(1)
+# sample = sample.split(dat$ENTR, SplitRatio = .80)
+# train = subset(dat, sample == TRUE)
+# test  = subset(dat, sample == FALSE)
+
+rf <- randomForest(ENTR ~ ., data=train, importance = TRUE)
+
+predtr <- predict(rf, train, type = "class")
+
+
+predte <- predict(rf, test, type = "class")
+
+mean(predtr== train$ENTR)
+mean(predte== test$ENTR)
+
+# table(predte, test$ENTR)
+
+
+
+
+
+```
+
+```{r svm}
+## Model - SVM
+
+
+
+# set.seed(1)
+# sample = sample.split(data.mod3$ENTR, SplitRatio = .80)
+# train = subset(data.mod3, sample == TRUE)
+# test  = subset(data.mod3, sample == FALSE)
+# 
+# svmfit = svm(ENTR ~ .,
+#              data = train, 
+#              kernel = "radial", 
+#              cost = 10, 
+#              scale = FALSE)
+# 
+# test_pred <- predict(svmfit, newdata = test)
+# confusionMatrix(table(test_pred, data.mod3$ENTR))
+# 
+# varImp(svmfit, conditional=TRUE)
+```
+
+```{r nn}
+## Model - Neural nets
+
+
+# 
+# set.seed(1)
+# sample = sample.split(data.mod3$ENTR, SplitRatio = .80)
+# train = subset(data.mod3, sample == TRUE)
+# test  = subset(data.mod3, sample == FALSE)
+# 
+# train.nn <- as.matrix(train, byrow = TRUE)
+# 
+# test.nn <- as.matrix(test, byrow = TRUE)
+# 
+# nn = neuralnet(ENTR ~ ., train.nn, hidden = 3 , linear.output = T )
