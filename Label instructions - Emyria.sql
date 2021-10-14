@@ -1,4 +1,4 @@
-SELECT DISTINCT MasterPatient_ID, ATCLevel5Name, ATCLevel3Name, ATCLevel1Name
+SELECT DISTINCT MasterPatient_ID, ATCLevel5Name, ATCLevel3Name
 FROM
     DimProductMaster d
 JOIN
@@ -12,5 +12,5 @@ ON
 
 WHERE ATCLevel1Name ILIKE '%NERVOUS SYSTEM%'
 AND ATCLevel2Name ILIKE '%PSYCHO%'
-AND MasterPatient_ID > 0 AND MasterPatient_ID < 1000000
+AND MasterPatient_ID > 0 AND MasterPatient_ID < 100000
 ORDER BY ATCLevel5Name
