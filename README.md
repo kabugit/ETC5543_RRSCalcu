@@ -3,4 +3,4 @@ This repo was made as a requirement for Monash's ETC5543  internship unit. Conta
 
 This project investigates the longitudinal patient journey of nearly all Australian patients, understanding their comorbidities and prescription history to compute a prescription risk score that could in turn also help to predict future hospitalisations. It was conducted by IQVIA and NostraData to help the Australian healthcare system to reduce the load on hospitals and healthcare workers so they can better and more safely deal with load posed by COVID 19.
 
-Files used for final model building are - Conditions.sql, CardiacDrugClass_Binary.sql, Modelling.rmd.
+Files used for final model building are - Conditions - entrv/snonEntr.sql, CardiacDrugClass_Binary - entrv/snonEntr.sql, Modelling.rmd.
